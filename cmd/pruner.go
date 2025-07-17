@@ -274,7 +274,29 @@ func pruneAppState(home string) error {
 	err = appStore.LoadLatestVersion()
 	if err != nil {
 		fmt.Printf("[pruneAppState] failed to load latest version: %v\n", err)
-		return err
+		
+		// Try to find the actual latest available version by checking what versions exist
+		fmt.Println("[pruneAppState] attempting to find actual latest version...")
+		
+		// Check if we can load an earlier version
+		for i := latestVersion; i > latestVersion-1000 && i > 0; i-- {
+			fmt.Printf("[pruneAppState] trying to load version %d\n", i)
+			tempStore := rootmulti.NewStore(appDB)
+			for _, value := range keys {
+				tempStore.MountStoreWithDB(storetypes.NewKVStoreKey(value), sdk.StoreTypeIAVL, nil)
+			}
+			if err := tempStore.LoadVersion(i); err == nil {
+				fmt.Printf("[pruneAppState] successfully loaded version %d\n", i)
+				appStore = tempStore
+				latestVersion = i
+				break
+			}
+		}
+		
+		if err != nil {
+			fmt.Printf("[pruneAppState] could not find any loadable version, skipping app state pruning\n")
+			return nil
+		}
 	}
 
 	allVersions := appStore.GetAllVersions()
