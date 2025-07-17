@@ -8,17 +8,18 @@ import (
 )
 
 var (
-	homePath   string
-	dataDir    string
-	backend    string
-	app        string
-	cosmosSdk  bool
-	tendermint bool
-	blocks     uint64
-	versions   uint64
-	tx_idx     bool
-	compact    bool
-	appName    = "cosmprund"
+	homePath      string
+	dataDir       string
+	backend       string
+	app           string
+	cosmosSdk     bool
+	tendermint    bool
+	blocks        uint64
+	versions      uint64
+	tx_idx        bool
+	compact       bool
+	initIAVL      bool
+	appName       = "cosmprund"
 )
 
 // NewRootCmd returns the root command for relayer.
@@ -79,6 +80,9 @@ func NewRootCmd() *cobra.Command {
 
 	// --compact flag
 	rootCmd.PersistentFlags().BoolVar(&compact, "compact", true, "set to false you dont want to compact dbs after prunning (default true)")
+
+	// --init-iavl flag
+	rootCmd.PersistentFlags().BoolVar(&initIAVL, "init-iavl", false, "attempt to initialize empty IAVL stores with current block height (default false)")
 
 	rootCmd.AddCommand(
 		pruneCmd(),

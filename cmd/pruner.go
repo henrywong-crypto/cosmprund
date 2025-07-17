@@ -42,13 +42,25 @@ func pruneCmd() *cobra.Command {
 				fmt.Println("checking application state...")
 				appDB, errDB := openDB("application", args[0])
 				if errDB == nil {
+					// Don't assume LastCommitID version is loadable - just check if it exists
 					appStore := rootmulti.NewStore(appDB)
-					latestAppVersion := appStore.LastCommitID().Version
-					fmt.Printf("latest application version: %d\n", latestAppVersion)
+					metadataVersion := appStore.LastCommitID().Version
+					fmt.Printf("metadata reports version: %d\n", metadataVersion)
 					
-					if txIdxHeight <= 0 || txIdxHeight > latestAppVersion {
-						txIdxHeight = latestAppVersion
-						fmt.Printf("adjusted txIdxHeight to: %d\n", txIdxHeight)
+					// Check if IAVL stores actually have any versions
+					keys := getStoreKeys(appDB)
+					if len(keys) > 0 {
+						prefix := "s/k:" + keys[0] + "/"
+						storeDB := db.NewPrefixDB(appDB, []byte(prefix))
+						actualStoreVersion := rootmulti.GetLatestVersion(storeDB)
+						fmt.Printf("actual store version: %d\n", actualStoreVersion)
+						
+						if actualStoreVersion > 0 {
+							txIdxHeight = actualStoreVersion
+							fmt.Printf("using actual store version for txIdxHeight: %d\n", txIdxHeight)
+						} else {
+							fmt.Println("IAVL stores are empty - will determine txIdxHeight from TM data")
+						}
 					}
 					appDB.Close()
 				}
@@ -227,17 +239,7 @@ func pruneAppState(home string) error {
 
 	var err error
 
-	//TODO: need to get all versions in the store, setting randomly is too slow
 	fmt.Println("pruning application state")
-
-	//// only mount keys from core sdk
-	//// todo allow for other keys to be mounted
-	//keys := types.NewKVStoreKeys(
-	//	authtypes.StoreKey, banktypes.StoreKey, stakingtypes.StoreKey,
-	//	minttypes.StoreKey, distrtypes.StoreKey, slashingtypes.StoreKey,
-	//	govtypes.StoreKey, paramstypes.StoreKey, ibchost.StoreKey, upgradetypes.StoreKey,
-	//	evidencetypes.StoreKey, ibctransfertypes.StoreKey, capabilitytypes.StoreKey,
-	//)
 
 	if app == "osmosis" {
 		fmt.Println("not support osmosis AppState, exit.")
@@ -250,126 +252,108 @@ func pruneAppState(home string) error {
 	// TODO: cleanup app state
 	appStore := rootmulti.NewStore(appDB)
 
-	// Check the latest version available in the store before setting txIdxHeight
-	latestVersion := appStore.LastCommitID().Version
-	fmt.Printf("[pruneAppState] latest available version in app store: %d\n", latestVersion)
-
-	if txIdxHeight <= 0 {
-		txIdxHeight = latestVersion
-		fmt.Printf("[pruneAppState] set txIdxHeight=%d\n", txIdxHeight)
-	} else {
-		fmt.Printf("[pruneAppState] using existing txIdxHeight=%d\n", txIdxHeight)
-		if txIdxHeight > latestVersion {
-			fmt.Printf("[pruneAppState] WARNING: txIdxHeight (%d) is greater than latest available version (%d)\n", txIdxHeight, latestVersion)
-			fmt.Printf("[pruneAppState] adjusting txIdxHeight to latest available version\n")
-			txIdxHeight = latestVersion
+	// FIXED: Don't use block height as IAVL version - detect actual available versions
+	fmt.Println("[pruneAppState] detecting actual available IAVL versions...")
+	
+	// Check what versions are actually available in the IAVL stores
+	var maxAvailableVersion int64 = 0
+	var hasAnyVersions = false
+	
+	// Sample a few stores to find the actual version range
+	for i, storeName := range keys {
+		if i >= 5 { // Check first 5 stores
+			break
+		}
+		
+		prefix := "s/k:" + storeName + "/"
+		storeDB := db.NewPrefixDB(appDB, []byte(prefix))
+		storeLatestVersion := rootmulti.GetLatestVersion(storeDB)
+		
+		fmt.Printf("[pruneAppState] store '%s' latest version: %d\n", storeName, storeLatestVersion)
+		
+		if storeLatestVersion > 0 {
+			hasAnyVersions = true
+			if storeLatestVersion > maxAvailableVersion {
+				maxAvailableVersion = storeLatestVersion
+			}
 		}
 	}
-
+	
+	if !hasAnyVersions {
+		fmt.Println("[pruneAppState] no IAVL versions found - stores are empty")
+		fmt.Println("[pruneAppState] this is normal for a fresh state-sync node")
+		fmt.Println("[pruneAppState] skipping application state pruning")
+		
+		// Optional: Try to initialize IAVL stores with current block height
+		if initIAVL {
+			fmt.Println("[pruneAppState] attempting to initialize IAVL stores...")
+			
+			// Get current block height from TM data
+			blockStoreDB, errBlock := openDB("blockstore", home)
+			if errBlock == nil {
+				blockStore := tmstore.NewBlockStore(blockStoreDB)
+				currentHeight := blockStore.Height()
+				blockStore.Close()
+				
+				fmt.Printf("[pruneAppState] initializing IAVL stores at height %d\n", currentHeight)
+				
+				// Mount and initialize stores
+				for _, value := range keys {
+					appStore.MountStoreWithDB(storetypes.NewKVStoreKey(value), sdk.StoreTypeIAVL, nil)
+				}
+				
+				// Try to set initial version
+				if err := appStore.SetInitialVersion(currentHeight); err == nil {
+					// Commit to create the version
+					commitID := appStore.Commit()
+					fmt.Printf("[pruneAppState] created initial IAVL version: %d\n", commitID.Version)
+					maxAvailableVersion = commitID.Version
+					hasAnyVersions = true
+				} else {
+					fmt.Printf("[pruneAppState] failed to initialize IAVL: %v\n", err)
+				}
+			}
+		}
+		
+		if !hasAnyVersions {
+			return nil
+		}
+	}
+	
+	fmt.Printf("[pruneAppState] detected max available IAVL version: %d\n", maxAvailableVersion)
+	
+	// Mount all stores
 	for _, value := range keys {
 		appStore.MountStoreWithDB(storetypes.NewKVStoreKey(value), sdk.StoreTypeIAVL, nil)
 	}
 
-	fmt.Printf("[pruneAppState] attempting to load version %d\n", latestVersion)
-	err = appStore.LoadLatestVersion()
+	// Try to load the actual available version
+	fmt.Printf("[pruneAppState] attempting to load available version %d\n", maxAvailableVersion)
+	err = appStore.LoadVersion(maxAvailableVersion)
 	if err != nil {
-		fmt.Printf("[pruneAppState] failed to load latest version: %v\n", err)
+		fmt.Printf("[pruneAppState] failed to load version %d: %v\n", maxAvailableVersion, err)
 		
-		// Try to find the actual latest available version by checking what versions exist
-		fmt.Println("[pruneAppState] attempting to find actual latest version...")
-		
-		// First, check what version ranges are actually available in the IAVL stores
-		fmt.Println("[pruneAppState] checking actual IAVL store version ranges...")
-		var actualLatestVersion int64 = 0
-		
-		for i, storeName := range keys {
-			if i >= 3 { // Only check first 3 stores to avoid spam
-				break
-			}
-			prefix := "s/k:" + storeName + "/"
-			storeDB := db.NewPrefixDB(appDB, []byte(prefix))
-			storeLatestVersion := rootmulti.GetLatestVersion(storeDB)
-			fmt.Printf("[pruneAppState] store '%s' reports latest version: %d\n", storeName, storeLatestVersion)
-			
-			if storeLatestVersion > 0 && storeLatestVersion < actualLatestVersion || actualLatestVersion == 0 {
-				actualLatestVersion = storeLatestVersion
-			}
-		}
-		
-		if actualLatestVersion > 0 && actualLatestVersion != latestVersion {
-			fmt.Printf("[pruneAppState] detected version mismatch: metadata=%d, actual=%d\n", latestVersion, actualLatestVersion)
-			fmt.Printf("[pruneAppState] trying to load actual latest version %d\n", actualLatestVersion)
-			
-			tempStore := rootmulti.NewStore(appDB)
-			for _, value := range keys {
-				tempStore.MountStoreWithDB(storetypes.NewKVStoreKey(value), sdk.StoreTypeIAVL, nil)
-			}
-			if err := tempStore.LoadVersion(actualLatestVersion); err == nil {
-				fmt.Printf("[pruneAppState] successfully loaded actual version %d\n", actualLatestVersion)
-				appStore = tempStore
-				latestVersion = actualLatestVersion
-			} else {
-				fmt.Printf("[pruneAppState] failed to load even the detected version %d: %v\n", actualLatestVersion, err)
-			}
-		}
-		
-		// If that didn't work, try a more targeted search around the detected version
-		if actualLatestVersion == 0 || err != nil {
-			fmt.Println("[pruneAppState] trying broader search around detected version range...")
-			
-			searchStart := actualLatestVersion
-			if searchStart == 0 {
-				searchStart = latestVersion - 100 // Search in the last 100 versions
-			}
-			
-			for i := searchStart; i >= searchStart-100 && i > 0; i-- {
-				tempStore := rootmulti.NewStore(appDB)
-				for _, value := range keys {
-					tempStore.MountStoreWithDB(storetypes.NewKVStoreKey(value), sdk.StoreTypeIAVL, nil)
-				}
-				if err := tempStore.LoadVersion(i); err == nil {
-					fmt.Printf("[pruneAppState] found working version: %d\n", i)
-					appStore = tempStore
-					latestVersion = i
-					err = nil
-					break
-				}
-			}
-		}
-		
-		// Check if we found a working version
-		if err == nil && latestVersion > 0 {
-			fmt.Printf("[pruneAppState] successfully loaded version %d, proceeding with pruning\n", latestVersion)
-		} else {
-			fmt.Printf("[pruneAppState] could not find any loadable version, skipping app state pruning\n")
-			fmt.Println("[pruneAppState] WARNING: IAVL stores appear to be corrupted or inconsistent")
-			fmt.Println("[pruneAppState] This could be due to:")
-			fmt.Println("[pruneAppState]   1. Previous incomplete pruning operation")
-			fmt.Println("[pruneAppState]   2. Database corruption")
-			fmt.Println("[pruneAppState]   3. Inconsistent state between metadata and IAVL trees")
-			fmt.Println("[pruneAppState] Recommendations:")
-			fmt.Println("[pruneAppState]   1. Try running the node to see if it can recover")
-			fmt.Println("[pruneAppState]   2. Consider state sync from a working node")
-			fmt.Println("[pruneAppState]   3. If the node starts successfully, the corruption may be limited to old versions")
-			
-			// Let's try to check if we can at least load without any specific version
-			fmt.Println("[pruneAppState] attempting to check if any version exists...")
-			tempStore := rootmulti.NewStore(appDB)
-			for _, value := range keys {
-				tempStore.MountStoreWithDB(storetypes.NewKVStoreKey(value), sdk.StoreTypeIAVL, nil)
-			}
-			
-			// Try to see what versions actually exist by checking the IAVL directly
-			fmt.Println("[pruneAppState] checking individual store versions...")
-			for _, storeName := range keys[:5] { // Check first 5 stores only to avoid spam
-				prefix := "s/k:" + storeName + "/"
-				storeDB := db.NewPrefixDB(appDB, []byte(prefix))
-				latestStoreVersion := rootmulti.GetLatestVersion(storeDB)
-				fmt.Printf("[pruneAppState] store '%s' latest version: %d\n", storeName, latestStoreVersion)
-			}
-			
+		// Try loading latest version without specifying version
+		fmt.Println("[pruneAppState] trying LoadLatestVersion as fallback...")
+		err = appStore.LoadLatestVersion()
+		if err != nil {
+			fmt.Printf("[pruneAppState] failed to load any version: %v\n", err)
+			fmt.Println("[pruneAppState] skipping application state pruning due to store loading issues")
 			return nil
 		}
+		
+		// Get the actual loaded version
+		actualVersion := appStore.LastCommitID().Version
+		fmt.Printf("[pruneAppState] successfully loaded actual version: %d\n", actualVersion)
+		maxAvailableVersion = actualVersion
+	} else {
+		fmt.Printf("[pruneAppState] successfully loaded version %d\n", maxAvailableVersion)
+	}
+
+	// Update txIdxHeight to match the actual loaded version (not block height)
+	if txIdxHeight <= 0 || txIdxHeight > maxAvailableVersion {
+		fmt.Printf("[pruneAppState] adjusting txIdxHeight from %d to %d (actual IAVL version)\n", txIdxHeight, maxAvailableVersion)
+		txIdxHeight = maxAvailableVersion
 	}
 
 	allVersions := appStore.GetAllVersions()
@@ -401,6 +385,7 @@ func pruneAppState(home string) error {
 		}
 	}
 
+	fmt.Println("[pruneAppState] application state pruning completed successfully")
 	return nil
 }
 
