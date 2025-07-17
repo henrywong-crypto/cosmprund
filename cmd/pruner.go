@@ -278,40 +278,67 @@ func pruneAppState(home string) error {
 		// Try to find the actual latest available version by checking what versions exist
 		fmt.Println("[pruneAppState] attempting to find actual latest version...")
 		
-		// Let's check a wider range but with bigger steps first to find a working version faster
-		var workingVersion int64 = 0
-		searchSteps := []int64{100, 50, 20, 10, 5, 1}
+		// First, check what version ranges are actually available in the IAVL stores
+		fmt.Println("[pruneAppState] checking actual IAVL store version ranges...")
+		var actualLatestVersion int64 = 0
 		
-		for _, step := range searchSteps {
-			fmt.Printf("[pruneAppState] searching with step size %d\n", step)
-			for i := latestVersion; i > latestVersion-10000 && i > 0; i -= step {
+		for i, storeName := range keys {
+			if i >= 3 { // Only check first 3 stores to avoid spam
+				break
+			}
+			prefix := "s/k:" + storeName + "/"
+			storeDB := db.NewPrefixDB(appDB, []byte(prefix))
+			storeLatestVersion := rootmulti.GetLatestVersion(storeDB)
+			fmt.Printf("[pruneAppState] store '%s' reports latest version: %d\n", storeName, storeLatestVersion)
+			
+			if storeLatestVersion > 0 && storeLatestVersion < actualLatestVersion || actualLatestVersion == 0 {
+				actualLatestVersion = storeLatestVersion
+			}
+		}
+		
+		if actualLatestVersion > 0 && actualLatestVersion != latestVersion {
+			fmt.Printf("[pruneAppState] detected version mismatch: metadata=%d, actual=%d\n", latestVersion, actualLatestVersion)
+			fmt.Printf("[pruneAppState] trying to load actual latest version %d\n", actualLatestVersion)
+			
+			tempStore := rootmulti.NewStore(appDB)
+			for _, value := range keys {
+				tempStore.MountStoreWithDB(storetypes.NewKVStoreKey(value), sdk.StoreTypeIAVL, nil)
+			}
+			if err := tempStore.LoadVersion(actualLatestVersion); err == nil {
+				fmt.Printf("[pruneAppState] successfully loaded actual version %d\n", actualLatestVersion)
+				appStore = tempStore
+				latestVersion = actualLatestVersion
+			} else {
+				fmt.Printf("[pruneAppState] failed to load even the detected version %d: %v\n", actualLatestVersion, err)
+			}
+		}
+		
+		// If that didn't work, try a more targeted search around the detected version
+		if actualLatestVersion == 0 || err != nil {
+			fmt.Println("[pruneAppState] trying broader search around detected version range...")
+			
+			searchStart := actualLatestVersion
+			if searchStart == 0 {
+				searchStart = latestVersion - 100 // Search in the last 100 versions
+			}
+			
+			for i := searchStart; i >= searchStart-100 && i > 0; i-- {
 				tempStore := rootmulti.NewStore(appDB)
 				for _, value := range keys {
 					tempStore.MountStoreWithDB(storetypes.NewKVStoreKey(value), sdk.StoreTypeIAVL, nil)
 				}
 				if err := tempStore.LoadVersion(i); err == nil {
 					fmt.Printf("[pruneAppState] found working version: %d\n", i)
-					workingVersion = i
+					appStore = tempStore
+					latestVersion = i
+					err = nil
 					break
 				}
 			}
-			if workingVersion > 0 {
-				break
-			}
 		}
 		
-		if workingVersion > 0 {
-			// Now load the working version
-			appStore = rootmulti.NewStore(appDB)
-			for _, value := range keys {
-				appStore.MountStoreWithDB(storetypes.NewKVStoreKey(value), sdk.StoreTypeIAVL, nil)
-			}
-			err = appStore.LoadVersion(workingVersion)
-			if err != nil {
-				fmt.Printf("[pruneAppState] failed to load working version %d: %v\n", workingVersion, err)
-				return nil
-			}
-			latestVersion = workingVersion
+		// Check if we found a working version
+		if err == nil && latestVersion > 0 {
 			fmt.Printf("[pruneAppState] successfully loaded version %d, proceeding with pruning\n", latestVersion)
 		} else {
 			fmt.Printf("[pruneAppState] could not find any loadable version, skipping app state pruning\n")
