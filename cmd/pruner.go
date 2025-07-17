@@ -40,7 +40,7 @@ func pruneCmd() *cobra.Command {
 			// First check if we need to prune application state to get a valid txIdxHeight
 			if cosmosSdk {
 				fmt.Println("checking application state...")
-				appDB, errDB := openDB("application", home)
+				appDB, errDB := openDB("application", args[0])
 				if errDB == nil {
 					appStore := rootmulti.NewStore(appDB)
 					latestAppVersion := appStore.LastCommitID().Version
