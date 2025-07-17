@@ -315,6 +315,32 @@ func pruneAppState(home string) error {
 			fmt.Printf("[pruneAppState] successfully loaded version %d, proceeding with pruning\n", latestVersion)
 		} else {
 			fmt.Printf("[pruneAppState] could not find any loadable version, skipping app state pruning\n")
+			fmt.Println("[pruneAppState] WARNING: IAVL stores appear to be corrupted or inconsistent")
+			fmt.Println("[pruneAppState] This could be due to:")
+			fmt.Println("[pruneAppState]   1. Previous incomplete pruning operation")
+			fmt.Println("[pruneAppState]   2. Database corruption")
+			fmt.Println("[pruneAppState]   3. Inconsistent state between metadata and IAVL trees")
+			fmt.Println("[pruneAppState] Recommendations:")
+			fmt.Println("[pruneAppState]   1. Try running the node to see if it can recover")
+			fmt.Println("[pruneAppState]   2. Consider state sync from a working node")
+			fmt.Println("[pruneAppState]   3. If the node starts successfully, the corruption may be limited to old versions")
+			
+			// Let's try to check if we can at least load without any specific version
+			fmt.Println("[pruneAppState] attempting to check if any version exists...")
+			tempStore := rootmulti.NewStore(appDB)
+			for _, value := range keys {
+				tempStore.MountStoreWithDB(storetypes.NewKVStoreKey(value), sdk.StoreTypeIAVL, nil)
+			}
+			
+			// Try to see what versions actually exist by checking the IAVL directly
+			fmt.Println("[pruneAppState] checking individual store versions...")
+			for _, storeName := range keys[:5] { // Check first 5 stores only to avoid spam
+				prefix := "s/k:" + storeName + "/"
+				storeDB := dbm.NewPrefixDB(appDB, []byte(prefix))
+				latestStoreVersion := rootmulti.GetLatestVersion(storeDB)
+				fmt.Printf("[pruneAppState] store '%s' latest version: %d\n", storeName, latestStoreVersion)
+			}
+			
 			return nil
 		}
 	}
