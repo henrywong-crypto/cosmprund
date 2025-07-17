@@ -336,7 +336,7 @@ func pruneAppState(home string) error {
 			fmt.Println("[pruneAppState] checking individual store versions...")
 			for _, storeName := range keys[:5] { // Check first 5 stores only to avoid spam
 				prefix := "s/k:" + storeName + "/"
-				storeDB := dbm.NewPrefixDB(appDB, []byte(prefix))
+				storeDB := db.NewPrefixDB(appDB, []byte(prefix))
 				latestStoreVersion := rootmulti.GetLatestVersion(storeDB)
 				fmt.Printf("[pruneAppState] store '%s' latest version: %d\n", storeName, latestStoreVersion)
 			}
