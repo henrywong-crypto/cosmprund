@@ -36,6 +36,24 @@ func pruneCmd() *cobra.Command {
 			//ctx := cmd.Context()
 			//errs, _ := errgroup.WithContext(ctx)
 			var err error
+			
+			// First check if we need to prune application state to get a valid txIdxHeight
+			if cosmosSdk {
+				fmt.Println("checking application state...")
+				appDB, errDB := openDB("application", home)
+				if errDB == nil {
+					appStore := rootmulti.NewStore(appDB)
+					latestAppVersion := appStore.LastCommitID().Version
+					fmt.Printf("latest application version: %d\n", latestAppVersion)
+					
+					if txIdxHeight <= 0 || txIdxHeight > latestAppVersion {
+						txIdxHeight = latestAppVersion
+						fmt.Printf("adjusted txIdxHeight to: %d\n", txIdxHeight)
+					}
+					appDB.Close()
+				}
+			}
+			
 			if tendermint {
 				if err = pruneTMData(args[0]); err != nil {
 					fmt.Println(err.Error())
@@ -227,25 +245,43 @@ func pruneAppState(home string) error {
 	}
 
 	keys := getStoreKeys(appDB)
+	fmt.Printf("[pruneAppState] found %d store keys: %v\n", len(keys), keys)
 
 	// TODO: cleanup app state
 	appStore := rootmulti.NewStore(appDB)
 
+	// Check the latest version available in the store before setting txIdxHeight
+	latestVersion := appStore.LastCommitID().Version
+	fmt.Printf("[pruneAppState] latest available version in app store: %d\n", latestVersion)
+
 	if txIdxHeight <= 0 {
-		txIdxHeight = appStore.LastCommitID().Version
+		txIdxHeight = latestVersion
 		fmt.Printf("[pruneAppState] set txIdxHeight=%d\n", txIdxHeight)
+	} else {
+		fmt.Printf("[pruneAppState] using existing txIdxHeight=%d\n", txIdxHeight)
+		if txIdxHeight > latestVersion {
+			fmt.Printf("[pruneAppState] WARNING: txIdxHeight (%d) is greater than latest available version (%d)\n", txIdxHeight, latestVersion)
+			fmt.Printf("[pruneAppState] adjusting txIdxHeight to latest available version\n")
+			txIdxHeight = latestVersion
+		}
 	}
 
 	for _, value := range keys {
 		appStore.MountStoreWithDB(storetypes.NewKVStoreKey(value), sdk.StoreTypeIAVL, nil)
 	}
 
+	fmt.Printf("[pruneAppState] attempting to load version %d\n", latestVersion)
 	err = appStore.LoadLatestVersion()
 	if err != nil {
+		fmt.Printf("[pruneAppState] failed to load latest version: %v\n", err)
 		return err
 	}
 
 	allVersions := appStore.GetAllVersions()
+	fmt.Printf("[pruneAppState] found %d versions in store\n", len(allVersions))
+	if len(allVersions) > 0 {
+		fmt.Printf("[pruneAppState] version range: %d to %d\n", allVersions[0], allVersions[len(allVersions)-1])
+	}
 
 	v64 := make([]int64, len(allVersions))
 	for i := 0; i < len(allVersions); i++ {
@@ -259,6 +295,7 @@ func pruneAppState(home string) error {
 		fmt.Printf("[pruneAppState] No need to prune (%d)\n", versionsToPrune)
 	} else {
 		appStore.PruneHeights = v64[:versionsToPrune]
+		fmt.Printf("[pruneAppState] will prune %d versions\n", len(appStore.PruneHeights))
 		appStore.PruneStores()
 	}
 
@@ -440,12 +477,17 @@ func compactDB(vdb db.DB) error {
 
 func getStoreKeys(db db.DB) (storeKeys []string) {
 	latestVer := rootmulti.GetLatestVersion(db)
+	fmt.Printf("[getStoreKeys] latest version from DB: %d\n", latestVer)
+
 	latestCommitInfo, err := getCommitInfo(db, latestVer)
 	if err != nil {
+		fmt.Printf("[getStoreKeys] error getting commit info for version %d: %v\n", latestVer, err)
 		panic(err)
 	}
 
+	fmt.Printf("[getStoreKeys] found commit info with %d stores\n", len(latestCommitInfo.StoreInfos))
 	for _, storeInfo := range latestCommitInfo.StoreInfos {
+		fmt.Printf("[getStoreKeys] store: %s, version: %d\n", storeInfo.Name, storeInfo.CommitId.Version)
 		storeKeys = append(storeKeys, storeInfo.Name)
 	}
 	return
