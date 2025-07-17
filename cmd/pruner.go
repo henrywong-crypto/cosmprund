@@ -278,22 +278,42 @@ func pruneAppState(home string) error {
 		// Try to find the actual latest available version by checking what versions exist
 		fmt.Println("[pruneAppState] attempting to find actual latest version...")
 		
-		// Check if we can load an earlier version
-		for i := latestVersion; i > latestVersion-1000 && i > 0; i-- {
-			fmt.Printf("[pruneAppState] trying to load version %d\n", i)
-			tempStore := rootmulti.NewStore(appDB)
-			for _, value := range keys {
-				tempStore.MountStoreWithDB(storetypes.NewKVStoreKey(value), sdk.StoreTypeIAVL, nil)
+		// Let's check a wider range but with bigger steps first to find a working version faster
+		var workingVersion int64 = 0
+		searchSteps := []int64{100, 50, 20, 10, 5, 1}
+		
+		for _, step := range searchSteps {
+			fmt.Printf("[pruneAppState] searching with step size %d\n", step)
+			for i := latestVersion; i > latestVersion-10000 && i > 0; i -= step {
+				tempStore := rootmulti.NewStore(appDB)
+				for _, value := range keys {
+					tempStore.MountStoreWithDB(storetypes.NewKVStoreKey(value), sdk.StoreTypeIAVL, nil)
+				}
+				if err := tempStore.LoadVersion(i); err == nil {
+					fmt.Printf("[pruneAppState] found working version: %d\n", i)
+					workingVersion = i
+					break
+				}
 			}
-			if err := tempStore.LoadVersion(i); err == nil {
-				fmt.Printf("[pruneAppState] successfully loaded version %d\n", i)
-				appStore = tempStore
-				latestVersion = i
+			if workingVersion > 0 {
 				break
 			}
 		}
 		
-		if err != nil {
+		if workingVersion > 0 {
+			// Now load the working version
+			appStore = rootmulti.NewStore(appDB)
+			for _, value := range keys {
+				appStore.MountStoreWithDB(storetypes.NewKVStoreKey(value), sdk.StoreTypeIAVL, nil)
+			}
+			err = appStore.LoadVersion(workingVersion)
+			if err != nil {
+				fmt.Printf("[pruneAppState] failed to load working version %d: %v\n", workingVersion, err)
+				return nil
+			}
+			latestVersion = workingVersion
+			fmt.Printf("[pruneAppState] successfully loaded version %d, proceeding with pruning\n", latestVersion)
+		} else {
 			fmt.Printf("[pruneAppState] could not find any loadable version, skipping app state pruning\n")
 			return nil
 		}
